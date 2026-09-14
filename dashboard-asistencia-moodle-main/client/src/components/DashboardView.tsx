@@ -133,7 +133,6 @@ export function DashboardView({ onCourseSelect, role }: { onCourseSelect: (cours
 
     // ESTADOS CONFIGURACIÓN GENERAL
     const [showConfigModal, setShowConfigModal] = useState(false);
-    const [configCourse, setConfigCourse] = useState<RegisteredCourse | null>(null);
     const [tempMinutes, setTempMinutes] = useState<number | string>('');
     const [tempThreshold, setTempThreshold] = useState<number | string>('');
     const [tempTotalHours, setTempTotalHours] = useState('');
@@ -173,44 +172,6 @@ export function DashboardView({ onCourseSelect, role }: { onCourseSelect: (cours
         axios.get('/api/courses/list')
             .then(res => setCourses(res.data.courses || []))
             .catch(console.error);
-    };
-
-    const openConfigModal = (course: RegisteredCourse, e: React.MouseEvent) => {
-        e.stopPropagation();
-        setConfigCourse(course);
-        setTempMinutes(course.minMinutes);
-        setTempThreshold(course.globalThreshold);
-        setTempTotalHours(course.totalHours || '30H');
-        setTempSchedule(course.scheduleTime || '09:00 - 14:00');
-        setTempHolidays(course.holidays || []);
-        setShowConfigModal(true);
-    };
-
-    const handleSaveConfig = async () => {
-        if (!configCourse) return;
-        setSavingConfig(true);
-        try {
-            await axios.put('/api/courses/settings', {
-                courseId: configCourse.courseId,
-                minMinutes: tempMinutes,
-                globalThreshold: tempThreshold,
-                totalHours: tempTotalHours,
-                scheduleTime: tempSchedule,
-                holidays: tempHolidays
-            });
-            setCourses(prev => prev.map(c =>
-                c.courseId === configCourse.courseId
-                    ? { ...c, minMinutes: Number(tempMinutes), globalThreshold: Number(tempThreshold), totalHours: tempTotalHours, scheduleTime: tempSchedule, holidays: tempHolidays }
-                    : c
-            ));
-            setShowConfigModal(false);
-            setShowCalendarModal(false);
-            alert("✅ Configuración guardada");
-        } catch (error) {
-            alert("Error al guardar");
-        } finally {
-            setSavingConfig(false);
-        }
     };
 
     const renderCalendarMonths = () => {

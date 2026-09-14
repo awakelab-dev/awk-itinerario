@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
-import { Modal, Button, ProgressBar, Form, Badge } from 'react-bootstrap';
+import { Modal, Button, ProgressBar, Form } from 'react-bootstrap';
 import { CourseSelector } from './CourseSelector';
 interface AsistenciaData {
   tiempoTexto: string;
