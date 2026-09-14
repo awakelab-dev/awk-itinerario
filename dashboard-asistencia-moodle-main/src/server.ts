@@ -803,6 +803,61 @@ const formatSimpleHours = (minutes: number) => {
 };
 
 // Helper: obtiene el set de usernames actualmente matriculados en Moodle para un curso.
+// Obtiene los usernames (en lowercase) de los miembros de un grupo de Moodle por groupId.
+// Consulta directamente la API de Moodle, sin depender de attendanceSettings.
+// Devuelve null si no se pudo consultar.
+async function getGroupMemberUsernames(db: any, courseId: string | number, groupId: string | number): Promise<Set<string> | null> {
+  try {
+    const moodleConfig = await getMoodleAccessConfig(db, String(courseId));
+    // Obtener miembros del grupo
+    const membersResp = await axios.get(moodleConfig.wsUrl, {
+      params: {
+        wstoken: moodleConfig.moodleToken,
+        wsfunction: 'core_group_get_group_members',
+        moodlewsrestformat: 'json',
+        'groupids[0]': Number(groupId)
+      },
+      timeout: 15000
+    });
+    const groupsData = Array.isArray(membersResp.data) ? membersResp.data : [];
+    if (groupsData.length === 0) return null;
+    const userIds = new Set<number>();
+    for (const g of groupsData) {
+      if (Array.isArray(g.userids)) {
+        for (const uid of g.userids) userIds.add(Number(uid));
+      }
+    }
+    if (userIds.size === 0) return null;
+    // Resolver userIds a usernames usando enrolled users
+    let moodleCourseId: any = moodleConfig.courseConfig?.courseId ?? courseId;
+    const enrollResp = await axios.get(moodleConfig.wsUrl, {
+      params: {
+        wstoken: moodleConfig.moodleToken,
+        wsfunction: 'core_enrol_get_enrolled_users',
+        moodlewsrestformat: 'json',
+        courseid: moodleCourseId
+      },
+      timeout: 15000
+    });
+    if (!Array.isArray(enrollResp.data)) return null;
+    const set = new Set<string>();
+    for (const u of enrollResp.data) {
+      if (userIds.has(Number(u.id))) {
+        const uname = String(u.username ?? '').trim().toLowerCase();
+        if (uname) set.add(uname);
+        const fullname = String(u.fullname ?? `${u.firstname ?? ''} ${u.lastname ?? ''}`.trim()).trim().toLowerCase();
+        if (fullname) set.add(fullname);
+        const email = String(u.email ?? '').trim().toLowerCase();
+        if (email) set.add(email);
+      }
+    }
+    return set.size > 0 ? set : null;
+  } catch (e: any) {
+    console.warn('⚠️ No se pudo obtener miembros del grupo desde Moodle:', e?.message || e);
+    return null;
+  }
+}
+
 // Devuelve null si no se pudo consultar (fallo de red, token, etc.) para que el caller
 // pueda decidir si continuar sin filtro o abortar.
 async function getEnrolledUsernames(db: any, courseId: string | number): Promise<Set<string> | null> {
@@ -920,13 +975,28 @@ app.get('/api/reports/weekly-export', async (req: any, res: any) => {
     }
 
     if (groupId && groupId !== 'todos') {
-      const targetGroupSetting = allSettings.find(s => String(s.groupId) === String(groupId));
-      if (targetGroupSetting) {
-        const targetName = (targetGroupSetting.groupName || '').toLowerCase().trim();
+      // Filtro principal: consultar miembros reales del grupo en Moodle por groupId
+      const groupMemberSet = await getGroupMemberUsernames(db, courseId, groupId);
+      if (groupMemberSet && groupMemberSet.size > 0) {
         allUsers = allUsers.filter((u: any) => {
-          const uGroup = (u.groupName || u.grupo || '').toLowerCase().trim();
-          return uGroup === targetName;
+          const uKey = String(u.usuario || u.userName || '').toLowerCase().trim();
+          const uName = String(u.nombre || '').toLowerCase().trim();
+          return groupMemberSet.has(uKey) || groupMemberSet.has(uName);
         });
+      } else {
+        // Fallback: si no se pudo consultar Moodle, intentar por groupName en attendanceSettings
+        const targetGroupSetting = allSettings.find(s => String(s.groupId) === String(groupId));
+        if (targetGroupSetting) {
+          const targetName = (targetGroupSetting.groupName || '').toLowerCase().trim();
+          allUsers = allUsers.filter((u: any) => {
+            const uGroup = (u.groupName || u.grupo || '').toLowerCase().trim();
+            return uGroup === targetName;
+          });
+        } else {
+          // El usuario seleccionó un grupo pero no tiene miembros ni config: mostrar vacío
+          console.log(`⚠️ Filtro grupo ${groupId}: sin miembros en Moodle ni config en attendanceSettings. Resultado vacío.`);
+          allUsers = [];
+        }
       }
     }
 
@@ -1302,13 +1372,28 @@ app.get('/api/reports/daily-export', async (req: any, res: any) => {
     const defaultEndDate = courseInfo?.endDate ? new Date(courseInfo.endDate) : null;
 
     if (groupId && groupId !== 'todos' && groupId !== '') {
-      const targetGroupSetting = allSettings.find(s => String(s.groupId) === String(groupId));
-      if (targetGroupSetting) {
-        const targetName = (targetGroupSetting.groupName || '').toLowerCase().trim();
+      // Filtro principal: consultar miembros reales del grupo en Moodle por groupId
+      const groupMemberSet = await getGroupMemberUsernames(db, courseId, groupId);
+      if (groupMemberSet && groupMemberSet.size > 0) {
         users = users.filter((u: any) => {
-          const uGroup = (u.groupName || u.grupo || '').toLowerCase().trim();
-          return uGroup === targetName;
+          const uKey = String(u.usuario || u.userName || '').toLowerCase().trim();
+          const uName = String(u.nombre || '').toLowerCase().trim();
+          return groupMemberSet.has(uKey) || groupMemberSet.has(uName);
         });
+      } else {
+        // Fallback: si no se pudo consultar Moodle, intentar por groupName en attendanceSettings
+        const targetGroupSetting = allSettings.find(s => String(s.groupId) === String(groupId));
+        if (targetGroupSetting) {
+          const targetName = (targetGroupSetting.groupName || '').toLowerCase().trim();
+          users = users.filter((u: any) => {
+            const uGroup = (u.groupName || u.grupo || '').toLowerCase().trim();
+            return uGroup === targetName;
+          });
+        } else {
+          // El usuario seleccionó un grupo pero no tiene miembros ni config: mostrar vacío
+          console.log(`⚠️ Filtro grupo ${groupId}: sin miembros en Moodle ni config en attendanceSettings. Resultado vacío.`);
+          users = [];
+        }
       }
     }
 
