@@ -301,6 +301,18 @@ export function DashboardView({ onCourseSelect, role }: { onCourseSelect: (cours
         setSelectedCourseForGroups(course);
         setShowGroupsListModal(true);
         loadConfiguredGroups(course.courseId);
+        // También cargar grupos de Moodle para mostrar los no configurados
+        try {
+            const res = await axios.get(`/api/groups/${course.courseId}`);
+            if (res.data.ok && Array.isArray(res.data.groups)) {
+                setAvailableMoodleGroups(res.data.groups);
+            } else {
+                setAvailableMoodleGroups([]);
+            }
+        } catch (e) {
+            console.error("Error cargando grupos Moodle:", e);
+            setAvailableMoodleGroups([]);
+        }
     };
 
     const loadConfiguredGroups = async (courseId: number) => {
@@ -706,16 +718,16 @@ export function DashboardView({ onCourseSelect, role }: { onCourseSelect: (cours
                 </Modal.Header>
                 <Modal.Body className="p-4">
                     <div className="d-flex justify-content-between align-items-center mb-3">
-                        <h5 className="m-0 fw-bold">Grupos Configurados</h5>
+                        <h5 className="m-0 fw-bold">Grupos del Curso</h5>
                         <Button variant="success" size="sm" onClick={() => handleOpenConfigModal(null)}>
                             <i className="fa-solid fa-plus me-2"></i>Agregar Grupo
                         </Button>
                     </div>
 
-                    {configuredGroups.length === 0 ? (
+                    {availableMoodleGroups.length === 0 && configuredGroups.length === 0 ? (
                         <Alert variant="info" className="text-center">
                             <i className="fa-solid fa-info-circle me-2"></i>
-                            No hay grupos configurados aún. ¡Agrega uno para empezar!
+                            No se encontraron grupos con estudiantes en Moodle para este curso.
                         </Alert>
                     ) : (
                         <Table hover responsive className="align-middle">
@@ -724,25 +736,80 @@ export function DashboardView({ onCourseSelect, role }: { onCourseSelect: (cours
                                     <th>Grupo Moodle</th>
                                     <th>Inicio</th>
                                     <th>Fin</th>
+                                    <th className="text-center">Estado</th>
                                     <th className="text-center">Config</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {configuredGroups.map((grp, idx) => (
-                                    <tr key={idx}>
-                                        <td className="fw-bold">{grp.groupName || `ID: ${grp.groupId}`}</td>
-                                        <td>{grp.startDate ? new Date(grp.startDate).toLocaleDateString() : '-'}</td>
-                                        <td>{grp.endDate ? new Date(grp.endDate).toLocaleDateString() : '-'}</td>
-                                        <td className="text-center">
-                                            <Button variant="outline-primary" size="sm" className="me-2" onClick={() => handleOpenConfigModal(grp)}>
-                                                <i className="fa-solid fa-gear"></i>
-                                            </Button>
-                                            <Button variant="outline-danger" size="sm" onClick={() => handleDeleteGroup(grp)}>
-                                                <i className="fa-solid fa-trash"></i>
-                                            </Button>
-                                        </td>
-                                    </tr>
-                                ))}
+                                {(() => {
+                                    // Merge: todos los grupos de Moodle + los configurados que no estén en Moodle
+                                    const configuredIds = new Set(configuredGroups.map(g => String(g.groupId).trim()));
+                                    const configuredNames = new Set(configuredGroups.map(g => (g.groupName || '').toLowerCase().trim()));
+                                    const rows: { moodleGroup?: any; config?: GroupSetting }[] = [];
+
+                                    // Primero: grupos de Moodle (con o sin config)
+                                    for (const mg of availableMoodleGroups) {
+                                        const cfg = configuredGroups.find(g =>
+                                            String(g.groupId).trim() === String(mg.id).trim() ||
+                                            (g.groupName || '').toLowerCase().trim() === (mg.name || '').toLowerCase().trim()
+                                        );
+                                        rows.push({ moodleGroup: mg, config: cfg });
+                                    }
+
+                                    // Luego: configurados que no tienen match en Moodle
+                                    for (const cfg of configuredGroups) {
+                                        const alreadyListed = rows.some(r => r.config === cfg);
+                                        if (!alreadyListed) {
+                                            rows.push({ config: cfg });
+                                        }
+                                    }
+
+                                    return rows.map((row, idx) => {
+                                        const name = row.moodleGroup?.name || row.config?.groupName || `ID: ${row.config?.groupId}`;
+                                        const hasConfig = !!row.config;
+                                        return (
+                                            <tr key={idx}>
+                                                <td className="fw-bold">{name}</td>
+                                                <td>{hasConfig && row.config?.startDate ? new Date(row.config.startDate).toLocaleDateString() : <span className="text-muted">-</span>}</td>
+                                                <td>{hasConfig && row.config?.endDate ? new Date(row.config.endDate).toLocaleDateString() : <span className="text-muted">-</span>}</td>
+                                                <td className="text-center">
+                                                    {hasConfig ? (
+                                                        <Badge bg="success" className="px-2 py-1"><i className="fa-solid fa-check me-1"></i>Configurado</Badge>
+                                                    ) : (
+                                                        <Badge bg="warning" text="dark" className="px-2 py-1"><i className="fa-solid fa-clock me-1"></i>Sin configurar</Badge>
+                                                    )}
+                                                </td>
+                                                <td className="text-center">
+                                                    {hasConfig ? (
+                                                        <>
+                                                            <Button variant="outline-primary" size="sm" className="me-2" onClick={() => handleOpenConfigModal(row.config!)}>
+                                                                <i className="fa-solid fa-gear"></i>
+                                                            </Button>
+                                                            <Button variant="outline-danger" size="sm" onClick={() => handleDeleteGroup(row.config!)}>
+                                                                <i className="fa-solid fa-trash"></i>
+                                                            </Button>
+                                                        </>
+                                                    ) : (
+                                                        <Button variant="primary" size="sm" onClick={() => {
+                                                            setEditingGroup(null);
+                                                            setTempGroupId(String(row.moodleGroup?.id || ''));
+                                                            setTempGroupName(row.moodleGroup?.name || '');
+                                                            setTempMinutes('');
+                                                            setTempThreshold('');
+                                                            setTempSchedule('09:00 - 14:00');
+                                                            setTempStartDate('');
+                                                            setTempEndDate('');
+                                                            setTempHolidays([]);
+                                                            setShowConfigModal(true);
+                                                        }}>
+                                                            <i className="fa-solid fa-plus me-1"></i>Configurar
+                                                        </Button>
+                                                    )}
+                                                </td>
+                                            </tr>
+                                        );
+                                    });
+                                })()}
                             </tbody>
                         </Table>
                     )}

@@ -440,20 +440,38 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
       }
     }
 
-    // Obtener grupos profundos
+    // Obtener grupos profundos (batch: una sola llamada para todos los grupos)
     try {
       const groupsResp = await axios.get(moodleConfig.wsUrl, {
         params: { wstoken: moodleConfig.moodleToken, wsfunction: 'core_group_get_course_groups', moodlewsrestformat: 'json', courseid: moodleCourseId }
       });
       const courseGroups = Array.isArray(groupsResp.data) ? groupsResp.data : [];
-      for (const grp of courseGroups) {
-        const membersResp = await axios.get(moodleConfig.wsUrl, {
-          params: { wstoken: moodleConfig.moodleToken, wsfunction: 'core_group_get_group_members', moodlewsrestformat: 'json', 'groupids[0]': grp.id }
-        });
-        const members = Array.isArray(membersResp.data) ? membersResp.data : [];
-        for (const m of members) {
-          const uname = userIdToUsername.get(m.userid);
-          if (uname) groupsByUsername.set(uname, grp.name);
+      if (courseGroups.length > 0) {
+        // Mapa groupId -> groupName para lookup rápido
+        const groupIdToName = new Map<number, string>();
+        courseGroups.forEach((g: any) => groupIdToName.set(Number(g.id), String(g.name)));
+
+        // Batch: pedir miembros de TODOS los grupos en una sola llamada
+        const memberParams: any = {
+          wstoken: moodleConfig.moodleToken,
+          wsfunction: 'core_group_get_group_members',
+          moodlewsrestformat: 'json'
+        };
+        courseGroups.forEach((g: any, i: number) => { memberParams[`groupids[${i}]`] = g.id; });
+
+        const membersResp = await axios.get(moodleConfig.wsUrl, { params: memberParams });
+        const membersByGroup: any[] = Array.isArray(membersResp.data) ? membersResp.data : [];
+
+        // Asignar grupo: solo si el usuario aún tiene "Sin Grupo" (no sobreescribir asignación previa)
+        for (const m of membersByGroup) {
+          const gName = groupIdToName.get(Number(m.groupid));
+          if (!gName) continue;
+          for (const uid of (m.userids || [])) {
+            const uname = userIdToUsername.get(uid);
+            if (uname && groupsByUsername.get(uname) === 'Sin Grupo') {
+              groupsByUsername.set(uname, gName);
+            }
+          }
         }
       }
     } catch (errGroup) { console.warn("Warn grupos:", errGroup); }
@@ -623,6 +641,13 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
       return 0;
     };
 
+    // Cuando hay plugin de logs, no registrar eventos del reporte ni lastcourseaccess
+    // porque los logs del plugin son más precisos y esos valores contaminan firstTs/lastTs.
+    const skipLca = !!process.env.MOODLE_LOG_WSFUNCTION;
+    if (skipLca) {
+      console.log('ℹ️ Eventos de reporte y lastcourseaccess omitidos: plugin de logs activo.');
+    }
+
     for (const row of rows) {
       const cells = row.columns || [];
       const user = toText(cells[usernameIdx]).trim();
@@ -663,22 +688,26 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
 
       const startTimestamp = parseSpanishDate(dateTextRaw);
 
-      if (startTimestamp > 0) {
+      if (startTimestamp > 0 && !skipLca) {
         // Timestamp de último acceso del reporte (un solo valor por fila).
+        // Se omite cuando hay plugin de logs activo, ya que sus eventos son más precisos.
         registrarEvento(agg, startTimestamp);
       }
     }
 
     // Fuente alternativa: lastcourseaccess desde la lista de matriculados.
-    // Se usa cuando el reporte Moodle (reportid 12) falla o devuelve 0 filas.
-    // El merge respeta entradas ya existentes del reporte si las hay.
+    // Se usa cuando no hay plugin de logs (MOODLE_LOG_WSFUNCTION). Cuando el plugin
+    // está activo, los eventos detallados ya cubren todos los accesos y lastcourseaccess
+    // contaminaría firstTs/lastTs con un timestamp que Moodle actualiza de forma asíncrona.
     let lcaCount = 0;
+
     for (const u of enrolledList) {
       const uname = normalizeUserKey(u?.username);
       if (!byUser.has(uname)) continue;
       const lastCourseAccess: number = u?.lastcourseaccess ?? 0;
       if (!lastCourseAccess || lastCourseAccess <= 0) continue;
 
+      if (skipLca) continue;
       const accessTs = lastCourseAccess * 1000; // Unix seconds → ms
       registrarEvento(byUser.get(uname)!, accessTs);
       lcaCount++;
@@ -703,10 +732,8 @@ app.get('/api/dailystats/:courseId', async (req: any, res: any) => {
             wstoken: moodleConfig.moodleToken,
             wsfunction: logWsFunction,
             moodlewsrestformat: 'json',
-            'courseids[0]': moodleCourseId,
             courseid: moodleCourseId,
             since: windowStart,
-            date: windowStart,
             userid: 0,
           }
         });
@@ -1418,7 +1445,9 @@ app.get('/api/reports/daily-export', async (req: any, res: any) => {
     const formatTime = (ts: number) => {
       if (!ts) return '--:--';
       const d = new Date(ts);
-      return d.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', hour12: false });
+      const h = d.getHours().toString().padStart(2, '0');
+      const m = d.getMinutes().toString().padStart(2, '0');
+      return h + ':' + m;
     };
 
     const previewData = [];
@@ -1478,35 +1507,27 @@ app.get('/api/reports/daily-export', async (req: any, res: any) => {
       const diaData = detalles.find((d: any) => d.fecha === dateQuery);
 
       if (diaData) {
-        // Valores originales por defecto
-        if (diaData.firstTs) entradaStr = formatTime(diaData.firstTs);
-        if (diaData.lastTs) salidaStr = formatTime(diaData.lastTs);
-
         if (!esNoLectivo) {
-          // Los minutos REALES ya fueron calculados en /api/dailystats (reconstrucción de
-          // sesiones cuando hay feed de eventos, o estimación por acceso si no lo hay).
-          // Aquí se confía en ese valor para mantener consistencia con el dashboard.
           minutosDia = diaData.minutos ?? 0;
 
-          // Entrada/salida solo para visualización: primer y último acceso recortados al horario.
-          if (diaData.firstTs && diaData.lastTs) {
-            const dStart = new Date(diaData.firstTs);
-            const dEnd = new Date(diaData.lastTs);
-            const actualStart = dStart.getHours() + (dStart.getMinutes() / 60);
-            const actualEnd = dEnd.getHours() + (dEnd.getMinutes() / 60);
-
-            const effectiveStart = Math.max(actualStart, limitStart);
-            let effectiveEnd = Math.min(actualEnd, limitEnd);
-
-            // Acceso único: sintetizar la salida a partir de los minutos estimados.
-            if (diaData.firstTs === diaData.lastTs && minutosDia > 0) {
-              effectiveEnd = Math.min(effectiveStart + (minutosDia / 60), limitEnd);
+          // Filtrar eventos dentro del horario del grupo para entrada/salida
+          const rawEvents: number[] = Array.isArray(diaData.events) ? diaData.events : [];
+          if (rawEvents.length > 0 && limitStart < limitEnd) {
+            const eventsInSchedule = rawEvents.filter((evTs: number) => {
+              const evDate = new Date(evTs);
+              const evHour = evDate.getHours() + evDate.getMinutes() / 60;
+              return evHour >= limitStart && evHour < limitEnd;
+            });
+            if (eventsInSchedule.length > 0) {
+              const sortedEv = eventsInSchedule.sort((a, b) => a - b);
+              entradaStr = formatTime(sortedEv[0]);
+              salidaStr = formatTime(sortedEv[sortedEv.length - 1]);
             }
-
-            if (effectiveEnd >= effectiveStart) {
-              entradaStr = decimalToTimeStr(effectiveStart);
-              salidaStr = decimalToTimeStr(effectiveEnd);
-            }
+            // Si no hay eventos dentro del horario, entrada/salida quedan '--:--'
+          } else {
+            // Sin eventos detallados o sin horario definido: usar firstTs/lastTs como fallback
+            if (diaData.firstTs) entradaStr = formatTime(diaData.firstTs);
+            if (diaData.lastTs) salidaStr = formatTime(diaData.lastTs);
           }
         }
       }
@@ -1846,8 +1867,9 @@ app.get('/api/courses', async (req: any, res: any) => {
 app.get('/api/groups/:courseId', async (req: any, res: any) => {
   try {
     const { courseId } = req.params;
+    console.log('📂 /api/groups llamado con courseId:', courseId);
     const db = await connectDB();
-    const moodleConfig = await getMoodleAccessConfig(db, courseId, { allowGlobalFallback: false });
+    const moodleConfig = await getMoodleAccessConfig(db, courseId, { allowGlobalFallback: true });
     const localCourseId = moodleConfig.courseConfig?.courseId;
     const localShortname = moodleConfig.courseConfig?.shortname;
     let foundCourse = null;
@@ -1882,8 +1904,10 @@ app.get('/api/groups/:courseId', async (req: any, res: any) => {
     }
 
     if (!foundCourse) {
+      console.warn('⚠️ /api/groups: Curso no encontrado en Moodle para courseId:', courseId, 'localCourseId:', localCourseId);
       return res.json({ ok: false, error: 'Curso no encontrado en Moodle' });
     }
+    console.log('📂 /api/groups: Curso Moodle encontrado:', foundCourse.id, foundCourse.shortname, '- buscando grupos...');
 
     const groupsResp = await axios.get(moodleConfig.wsUrl, {
       params: {
@@ -1894,7 +1918,38 @@ app.get('/api/groups/:courseId', async (req: any, res: any) => {
       }
     });
 
-    res.json({ ok: true, groups: groupsResp.data });
+    const allGroups: any[] = Array.isArray(groupsResp.data) ? groupsResp.data : [];
+
+    // Filtrar: devolver solo grupos que tienen al menos un estudiante matriculado
+    if (allGroups.length > 0) {
+      const memberParams: any = {
+        wstoken: moodleConfig.moodleToken,
+        wsfunction: 'core_group_get_group_members',
+        moodlewsrestformat: 'json'
+      };
+      allGroups.forEach((g: any, i: number) => { memberParams[`groupids[${i}]`] = g.id; });
+
+      try {
+        const membersResp = await axios.get(moodleConfig.wsUrl, { params: memberParams });
+        const membersByGroup: any[] = Array.isArray(membersResp.data) ? membersResp.data : [];
+
+        // Set de groupIds que tienen miembros
+        const groupsWithMembers = new Set<number>();
+        for (const m of membersByGroup) {
+          if (Array.isArray(m.userids) && m.userids.length > 0) {
+            groupsWithMembers.add(Number(m.groupid));
+          }
+        }
+
+        const filtered = allGroups.filter((g: any) => groupsWithMembers.has(Number(g.id)));
+        console.log('📂 /api/groups: ' + allGroups.length + ' grupos totales, ' + filtered.length + ' con estudiantes');
+        return res.json({ ok: true, groups: filtered });
+      } catch (eMem) {
+        console.warn('⚠️ No se pudo filtrar grupos por miembros, devolviendo todos:', (eMem as any)?.message);
+      }
+    }
+
+    res.json({ ok: true, groups: allGroups });
 
   } catch (error) {
     console.error(error);
@@ -3136,6 +3191,60 @@ function reconstruirMinutosSesion(
   totalMs += prev - sessionStart;       // CRÍTICO: cerrar la última sesión abierta
 
   return Math.round(totalMs / 60_000);
+}
+
+
+
+// Devuelve las sesiones individuales como rangos [{startMs, endMs, minutes}].
+// Usa la misma lógica que reconstruirMinutosSesion pero conserva los límites de cada sesión.
+function extraerSesiones(
+  eventosMs: number[],
+  horarioTexto: string,
+  umbralInactividadMin: number = UMBRAL_INACTIVIDAD_MIN
+): { startMs: number; endMs: number; minutes: number }[] {
+  if (!eventosMs || eventosMs.length === 0) return [];
+
+  let horaInicio = 0;
+  let horaFin = 24;
+  if (horarioTexto && horarioTexto.includes('-')) {
+    const partes = horarioTexto.split('-');
+    horaInicio = parseHoraDecimal(partes[0], 0);
+    horaFin = parseHoraDecimal(partes[1], 24);
+  }
+
+  const dentroHorario = (ts: number) => {
+    const d = new Date(ts);
+    const h = d.getHours() + d.getMinutes() / 60;
+    return h >= horaInicio && h <= horaFin;
+  };
+
+  const ev = eventosMs.filter(dentroHorario).sort((a, b) => a - b);
+  if (ev.length === 0) return [];
+
+  // Un solo evento: sesión puntual de 0 minutos
+  if (ev.length === 1) {
+    return [{ startMs: ev[0], endMs: ev[0], minutes: 0 }];
+  }
+
+  const umbralMs = umbralInactividadMin * 60_000;
+  const sesiones: { startMs: number; endMs: number; minutes: number }[] = [];
+  let sessionStart = ev[0];
+  let prev = ev[0];
+
+  for (let i = 1; i < ev.length; i++) {
+    const t = ev[i];
+    if (t - prev > umbralMs) {
+      const mins = Math.round((prev - sessionStart) / 60_000);
+      sesiones.push({ startMs: sessionStart, endMs: prev, minutes: mins });
+      sessionStart = t;
+    }
+    prev = t;
+  }
+  // Cerrar última sesión
+  const mins = Math.round((prev - sessionStart) / 60_000);
+  sesiones.push({ startMs: sessionStart, endMs: prev, minutes: mins });
+
+  return sesiones;
 }
 
 // calcularMinutosEnHorario eliminada — era código muerto reemplazado por reconstruirMinutosSesion.
